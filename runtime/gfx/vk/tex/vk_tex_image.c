@@ -66,11 +66,12 @@ static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img) {
     // diagnosed by elenotrindade). A depth or stencil image is not read through other formats in that memory, so it
     // gets its own; a colour one stays bound, as the game may alias it. MKW_POOL_SPILL=1 binds them all as before.
     static int spill_env = -1;
+    static volatile int32_t n_spill;
     if (spill_env < 0) spill_env = cfg_get("MKW_POOL_SPILL") && atoi(cfg_get("MKW_POOL_SPILL"));
     if ((e->f.depth || e->f.stencil) && req.size > e->t.L.size && !spill_env) {
-        rt_log("vk_tex: depth %#llx %ux%u fmt %#x takes %#llx bytes for NVN's %#llx: own memory (MKW_POOL_SPILL)",
-               (unsigned long long)e->pub.addr, e->key.d.width, e->key.d.height, e->key.d.format,
-               (unsigned long long)req.size, (unsigned long long)e->t.L.size);
+        log_limited(&n_spill, "vk_tex: depth %#llx %ux%u fmt %#x takes %#llx bytes for NVN's %#llx: own memory "
+                    "(MKW_POOL_SPILL)", (unsigned long long)e->pub.addr, e->key.d.width, e->key.d.height,
+                    e->key.d.format, (unsigned long long)req.size, (unsigned long long)e->t.L.size);
         return 0;
     }
     VkMemSpan sp;
@@ -453,7 +454,7 @@ Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         plat_inc32(&why[w]);
         int32_t all = 0;
         for (int i = 0; i < 6; i++) all += why[i];
-        if (all % 256 == 0)
+        if (all % 4096 == 0)
             rt_log("vk: ASTC BC1 (MKW_ASTC_BC1): %d of %d images; BC7 for 4096+ %d, no CPU storage %d, GPU-only %d, "
                    "sparse %d, alpha %d (BC1 for alpha 1 decoded in every texel %d, %.0f ms decoding)", why[0], all,
                    why[1], why[2], why[3], why[4], why[5], alpha_one, alpha_ns / 1e6);
@@ -563,14 +564,24 @@ Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (vk_sparse_create(&ci, d, k->addr, L.size, &img, &e->sparse_tail)) e->sparse = 1;
-    else if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    uint32_t image_levels = levels, image_layers = layers;
+    int sr = vk_sparse_create(&ci, d, k->addr, L.size, &img, &e->sparse_tail, &image_levels, &image_layers);
+    if (sr > 0) e->sparse = 1;
+    else if (sr == 0 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
             log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x, %u levels, %u layers) cannot alias its pool memory; "
                         "own memory instead", (unsigned long long)k->addr, w, h, d->format, ci.mipLevels, ci.arrayLayers);
         }
+    }
+    if (sr < 0) {
+        // A large sparse image whose address space does not fit: a non-sparse one of the same shape cannot fit either,
+        // and vk_mem_relieve would trim textures and wait for the GPU only to fail again. The slot resolves to the
+        // zero stand-in, as it did when the create failed; vk_sparse_create remembered the shape so retries are free.
+        plat_inc32(&n_failed);
+        free(e);
+        return NULL;
     }
     if (!img) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
@@ -628,7 +639,7 @@ Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->type = type;
     p->usage = usage;
     p->aspect = aspect_of(&f);
-    p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
+    p->width = w, p->height = h, p->depth = depth, p->levels = image_levels, p->layers = image_layers, p->samples = samples;
     p->drop = (uint8_t)drop;
     p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
                  : type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
