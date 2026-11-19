@@ -418,12 +418,15 @@ void vk_mem_shutdown(void);                        // before vk_shutdown: waits 
 // until the next call that may drop textures (release, pool fini); copy what outlives that.
 typedef struct {
     VkImage image;
+    VkImage image_b;               // a 64 + 4 split: layers 64.. in a second sparse image
     VkFormat format;               // after the fallbacks of tex_vk_format (ASTC -> RGBA8, RGB -> RGBA)
     VkImageType type;
     VkImageViewType view_type;     // view of the whole image
     VkImageAspectFlags aspect;
     VkImageUsageFlags usage;
     uint32_t width, height, depth, levels, layers, samples;
+    uint32_t levels_b, layers_b;   // image_b's levels and layers (0: not split)
+    uint32_t split_layer;          // image_b's first array layer (64); 0: not split
     uint64_t addr;                 // storage GPU address
     uint8_t alpha_one;             // X format: sample alpha as 1 through the view swizzle
     uint8_t chan[4];               // TexVkFormat.chan: component order of a stand-in format, applied by the view swizzle
